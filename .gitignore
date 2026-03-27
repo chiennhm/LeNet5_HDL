@@ -1,0 +1,18 @@
+# Ignore everything
+*
+
+# Allow directory traversal
+!*/
+
+# --- Python source ---
+!LeNet_py/*.py
+!scripts/*.py
+
+# --- RTL source ---
+!rtl/*.v
+!tb/*.v
+!sim/*.bat
+
+# --- Keep gitignore and readme ---
+!.gitignore
+!README.md
