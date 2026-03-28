@@ -36,7 +36,7 @@ def rand_weights(n, scale=0.1):
 def zero_biases(n):
     return [0.0] * n
 
-mem = "d:/LeNetHDL/mem"
+mem = "d:/LeNetHDL/LeNet_verilog"
 
 print("Generating weight files...")
 print("Architecture: 28×28 input, matching model.py\n")
