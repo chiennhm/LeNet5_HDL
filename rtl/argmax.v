@@ -10,7 +10,7 @@ module argmax #(
     input  wire                    clk,
     input  wire                    rst_n,
     input  wire                    start,
-    output wire [9:0]              in_addr,   // address to read input buffer
+    output wire [11:0]             in_addr,   // address to read input buffer
     input  wire signed [DATA_WIDTH-1:0] in_data,
     output reg                     done,
     output reg  [3:0]              class_out
@@ -26,7 +26,7 @@ module argmax #(
     reg [1:0] state;
 
     // Address is the current counter (combinational read)
-    assign in_addr = {6'b0, cnt};
+    assign in_addr = {8'b0, cnt};
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

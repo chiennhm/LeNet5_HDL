@@ -1,6 +1,6 @@
 // ============================================================================
 // Testbench for LeNet-5 Top Module
-// 1. Loads a 14×14 test image from test_image.hex
+// 1. Loads a 28×28 test image from test_image.hex
 // 2. Writes pixels into the design
 // 3. Asserts start, waits for done
 // 4. Prints predicted digit
@@ -17,7 +17,7 @@ module tb_lenet5;
 
     // ---- DUT signals -------------------------------------------------------
     reg  [7:0] pixel_data;
-    reg  [7:0] pixel_addr;
+    reg  [9:0] pixel_addr;
     reg        pixel_we;
     reg        start;
     wire       done;
@@ -36,7 +36,7 @@ module tb_lenet5;
     );
 
     // ---- Test image memory -------------------------------------------------
-    reg [7:0] test_img [0:195];
+    reg [7:0] test_img [0:783];
     initial $readmemh("test_image.hex", test_img);
 
     // ---- Cycle counter for performance measurement -------------------------
@@ -70,11 +70,11 @@ module tb_lenet5;
 
         // ----- Load image into DUT -----------------------------------------
         $display("========================================");
-        $display(" LeNet-5 MNIST 14x14 Inference Test");
+        $display(" LeNet-5 MNIST 28x28 Inference Test");
         $display("========================================");
-        $display("[%0t] Loading test image (196 pixels)...", $time);
+        $display("[%0t] Loading test image (784 pixels)...", $time);
 
-        for (i = 0; i < 196; i = i + 1) begin
+        for (i = 0; i < 784; i = i + 1) begin
             @(posedge clk);
             pixel_addr <= i;
             pixel_data <= test_img[i];
@@ -105,7 +105,7 @@ module tb_lenet5;
 
     // ---- Timeout watchdog -------------------------------------------------
     initial begin
-        #(CLK_PERIOD * 500000);  // 500k cycles max
+        #(CLK_PERIOD * 5000000);  // 5M cycles max (larger network)
         $display("ERROR: Simulation timed out!");
         $finish;
     end

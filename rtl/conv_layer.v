@@ -6,12 +6,12 @@
 // Fixed-point Q8.8 arithmetic (16-bit signed).
 // ============================================================================
 module conv_layer #(
-    parameter IN_SIZE     = 14,       // input spatial dimension (square)
+    parameter IN_SIZE     = 28,       // input spatial dimension (square)
     parameter IN_CH       = 1,        // input channels
     parameter OUT_CH      = 6,        // output channels (num filters)
     parameter KERNEL      = 5,        // kernel spatial dimension
-    parameter WEIGHT_FILE = "/mem/conv1_weights.hex",
-    parameter BIAS_FILE   = "/mem/conv1_bias.hex"
+    parameter WEIGHT_FILE = "mem/conv1_weights.hex",
+    parameter BIAS_FILE   = "mem/conv1_bias.hex"
 )(
     input  wire        clk,
     input  wire        rst_n,
@@ -19,11 +19,11 @@ module conv_layer #(
     output reg         done,
 
     // Input feature-map read port (active layer → buffer in top module)
-    output wire [9:0]  in_addr,
+    output wire [11:0] in_addr,
     input  wire signed [15:0] in_data,
 
     // Output feature-map write port
-    output reg  [9:0]  out_addr,
+    output reg  [11:0] out_addr,
     output reg  signed [15:0] out_data,
     output reg         out_we
 );
@@ -41,7 +41,7 @@ module conv_layer #(
         $readmemh(BIAS_FILE,   biases);
     end
 
-    // ---- Loop counters (8-bit each, sufficient for all configs) -----------
+    // ---- Loop counters ----------------------------------------------------
     reg [7:0] oc;   // output channel
     reg [7:0] oy;   // output row
     reg [7:0] ox;   // output col
@@ -95,7 +95,7 @@ module conv_layer #(
             oc <= 0; oy <= 0; ox <= 0;
             ic <= 0; ky <= 0; kx <= 0;
             acc      <= 32'sd0;
-            out_addr <= 10'd0;
+            out_addr <= 12'd0;
             out_data <= 16'sd0;
         end else begin
             out_we <= 1'b0;   // default: no write

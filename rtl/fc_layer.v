@@ -4,10 +4,10 @@
 // Fixed-point Q8.8, 32-bit accumulator.
 // ============================================================================
 module fc_layer #(
-    parameter IN_SIZE     = 16,
-    parameter OUT_SIZE    = 120,
-    parameter WEIGHT_FILE = "fc1_weights.hex",
-    parameter BIAS_FILE   = "fc1_bias.hex",
+    parameter IN_SIZE     = 120,
+    parameter OUT_SIZE    = 84,
+    parameter WEIGHT_FILE = "mem/fc1_weights.hex",
+    parameter BIAS_FILE   = "mem/fc1_bias.hex",
     parameter APPLY_RELU  = 1            // 1 = apply ReLU, 0 = linear
 )(
     input  wire        clk,
@@ -16,11 +16,11 @@ module fc_layer #(
     output reg         done,
 
     // Input vector read port
-    output wire [9:0]  in_addr,
+    output wire [11:0] in_addr,
     input  wire signed [15:0] in_data,
 
     // Output vector write port
-    output reg  [9:0]  out_addr,
+    output reg  [11:0] out_addr,
     output reg  signed [15:0] out_data,
     output reg         out_we
 );
@@ -52,7 +52,7 @@ module fc_layer #(
     reg [2:0] state;
 
     // ---- Combinational input address --------------------------------------
-    assign in_addr = i;
+    assign in_addr = {4'b0, i};
 
     // ---- Weight lookup ----------------------------------------------------
     wire [15:0] w_idx = j * IN_SIZE + i;
@@ -109,7 +109,7 @@ module fc_layer #(
                 end
 
                 S_WRITE: begin
-                    out_addr <= j;
+                    out_addr <= {4'b0, j};
                     out_data <= activated;
                     out_we   <= 1'b1;
 
