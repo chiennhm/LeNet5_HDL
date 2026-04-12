@@ -37,7 +37,7 @@ module tb_lenet5;
 
     // ---- Test image memory -------------------------------------------------
     reg [7:0] test_img [0:783];
-    initial $readmemh("test_image.hex", test_img);
+    initial $readmemh("D:/LeNetHDL/mem/test_image.hex", test_img);
 
     // ---- Cycle counter for performance measurement -------------------------
     integer cycle_cnt;

@@ -1,16 +1,23 @@
 // ============================================================================
-// Convolution Layer Engine (Parameterized)
-// Performs 2-D convolution with KERNEL×KERNEL filters.
-// Reads input feature map via address/data port, writes output via write port.
-// Weights & biases loaded from hex files. ReLU applied at output.
-// Fixed-point Q8.8 arithmetic (16-bit signed).
+// Convolution Layer Engine — Resource-Optimized for Cyclone II
+//
+// Key changes vs. original:
+//   1. Weights stored in external weight_rom (M4K), accessed via w_addr/w_data.
+//   2. Biases kept as small internal register array (INT8).
+//   3. All address computation uses sequential counters (additions only,
+//      no runtime multipliers).
+//   4. Extra S_WAIT state accounts for 1-cycle M4K read latency.
+//
+// Arithmetic:
+//   input  Q8.8 (16-bit signed)  ×  weight INT8 (Q0.7)
+//   product = Q8.15 (24-bit)  →  accumulator Q16.15 (32-bit)
+//   output  = acc[22:7] → Q8.8 with saturation + ReLU
 // ============================================================================
 module conv_layer #(
-    parameter IN_SIZE     = 28,       // input spatial dimension (square)
-    parameter IN_CH       = 1,        // input channels
-    parameter OUT_CH      = 6,        // output channels (num filters)
-    parameter KERNEL      = 5,        // kernel spatial dimension
-    parameter WEIGHT_FILE = "mem/conv1_weights.hex",
+    parameter IN_SIZE     = 28,
+    parameter IN_CH       = 1,
+    parameter OUT_CH      = 6,
+    parameter KERNEL      = 5,
     parameter BIAS_FILE   = "mem/conv1_bias.hex"
 )(
     input  wire        clk,
@@ -18,69 +25,62 @@ module conv_layer #(
     input  wire        start,
     output reg         done,
 
-    // Input feature-map read port (active layer → buffer in top module)
-    output wire [11:0] in_addr,
+    // Input feature-map read port (to dpram)
+    output reg  [11:0] in_addr,
     input  wire signed [15:0] in_data,
 
-    // Output feature-map write port
+    // Output feature-map write port (to dpram)
     output reg  [11:0] out_addr,
     output reg  signed [15:0] out_data,
-    output reg         out_we
+    output reg         out_we,
+
+    // Weight ROM read port
+    output reg  [14:0] w_addr,
+    input  wire signed [7:0]  w_data
 );
 
-    // Derived constants
-    localparam OUT_SIZE    = IN_SIZE - KERNEL + 1;
-    localparam NUM_WEIGHTS = OUT_CH * IN_CH * KERNEL * KERNEL;
-    localparam NUM_BIASES  = OUT_CH;
+    // ---- Derived constants (all compile-time, no hardware) -----------------
+    localparam OUT_SIZE   = IN_SIZE - KERNEL + 1;
+    localparam FILT_SIZE  = IN_CH * KERNEL * KERNEL;   // weights per filter
 
-    // ---- Weight / Bias ROM ------------------------------------------------
-    reg signed [15:0] weights [0:NUM_WEIGHTS-1];
-    reg signed [15:0] biases  [0:NUM_BIASES-1];
-    initial begin
-        $readmemh(WEIGHT_FILE, weights);
-        $readmemh(BIAS_FILE,   biases);
-    end
+    // Address-increment constants (additions only at runtime)
+    localparam [11:0] KY_STEP = IN_SIZE - KERNEL + 1;
+    //   when kx wraps → 0 and ky increments
+    localparam [11:0] IC_STEP = IN_SIZE * IN_SIZE
+                              - (KERNEL - 1) * (IN_SIZE + 1);
+    //   when kx,ky both wrap and ic increments
+    localparam [11:0] OY_STEP = KERNEL;
+    //   pix_base delta when ox wraps → 0 and oy increments
+    //   (= IN_SIZE - OUT_SIZE + 1 = KERNEL)
+
+    // ---- Bias ROM (small, remains in LUT registers) -----------------------
+    reg signed [7:0] biases [0:OUT_CH-1];
+    initial $readmemh(BIAS_FILE, biases);
 
     // ---- Loop counters ----------------------------------------------------
-    reg [7:0] oc;   // output channel
-    reg [7:0] oy;   // output row
-    reg [7:0] ox;   // output col
-    reg [7:0] ic;   // input channel
-    reg [7:0] ky;   // kernel row
-    reg [7:0] kx;   // kernel col
+    reg [7:0] oc, oy, ox, ic, ky, kx;
 
-    // ---- Accumulator (Q16.16 to hold sum-of-products) ---------------------
+    // ---- Address / accumulator registers ----------------------------------
+    reg [11:0] pix_base;       // input base addr for current (oy,ox)
+    reg [14:0] w_base;         // weight base addr for current oc
+    reg [11:0] out_cnt;        // sequential output address counter
     reg signed [31:0] acc;
 
     // ---- FSM --------------------------------------------------------------
     localparam S_IDLE  = 3'd0,
                S_BIAS  = 3'd1,
-               S_MAC   = 3'd2,
-               S_WRITE = 3'd3,
-               S_DONE  = 3'd4;
+               S_WAIT  = 3'd2,   // 1-cycle pipeline for M4K read
+               S_MAC   = 3'd3,
+               S_WRITE = 3'd4,
+               S_DONE  = 3'd5;
     reg [2:0] state;
 
-    // ---- Combinational address into input buffer --------------------------
-    // Layout: channel-major  addr = ic*IN_SIZE*IN_SIZE + (oy+ky)*IN_SIZE + (ox+kx)
-    assign in_addr = ic * (IN_SIZE * IN_SIZE)
-                   + (oy + ky) * IN_SIZE
-                   + (ox + kx);
+    // ---- MAC arithmetic: Q8.8 × INT8(Q0.7) = Q8.15 (24-bit) -------------
+    wire signed [23:0] mult = in_data * w_data;
 
-    // ---- Combinational weight lookup --------------------------------------
-    wire [15:0] w_idx;
-    assign w_idx = oc * (IN_CH * KERNEL * KERNEL)
-                 + ic * (KERNEL * KERNEL)
-                 + ky * KERNEL
-                 + kx;
-
-    wire signed [15:0] w_val = weights[w_idx];
-
-    // ---- Multiply (Q8.8 × Q8.8 = Q16.16) ---------------------------------
-    wire signed [31:0] mult = in_data * w_val;
-
-    // ---- Q16.16 → Q8.8 with saturation & ReLU ----------------------------
-    wire signed [15:0] acc_q88 = acc[23:8];
-    wire overflow = (acc[31:24] != {8{acc[23]}});
+    // ---- Output: Q16.15 accumulator → Q8.8 with saturation + ReLU --------
+    wire signed [15:0] acc_q88 = acc[22:7];
+    wire overflow = (acc[31:23] != {9{acc[22]}});
     wire signed [15:0] saturated = overflow
         ? (acc[31] ? 16'sh8000 : 16'sh7FFF)
         : acc_q88;
@@ -95,6 +95,11 @@ module conv_layer #(
             oc <= 0; oy <= 0; ox <= 0;
             ic <= 0; ky <= 0; kx <= 0;
             acc      <= 32'sd0;
+            pix_base <= 12'd0;
+            w_base   <= 15'd0;
+            out_cnt  <= 12'd0;
+            in_addr  <= 12'd0;
+            w_addr   <= 15'd0;
             out_addr <= 12'd0;
             out_data <= 16'sd0;
         end else begin
@@ -106,66 +111,88 @@ module conv_layer #(
                     done <= 1'b0;
                     if (start) begin
                         oc <= 0; oy <= 0; ox <= 0;
-                        state <= S_BIAS;
+                        pix_base <= 12'd0;
+                        w_base   <= 15'd0;
+                        out_cnt  <= 12'd0;
+                        state    <= S_BIAS;
                     end
                 end
 
                 // -----------------------------------------------------------
                 S_BIAS: begin
-                    // Load bias into accumulator, shifted to Q16.16
-                    acc <= { {8{biases[oc][15]}}, biases[oc], 8'b0 };
+                    // Load bias (INT8, Q0.7) into acc aligned to Q16.15
+                    acc <= {{16{biases[oc][7]}}, biases[oc], 8'b0};
                     ic  <= 0; ky <= 0; kx <= 0;
+                    // Issue first read addresses
+                    in_addr <= pix_base;
+                    w_addr  <= w_base;
+                    state   <= S_WAIT;
+                end
+
+                // -----------------------------------------------------------
+                S_WAIT: begin
+                    // M4K registered read — data arrives next cycle
                     state <= S_MAC;
                 end
 
                 // -----------------------------------------------------------
                 S_MAC: begin
-                    // Accumulate one product per clock
-                    acc <= acc + mult;
+                    // Accumulate product (sign-extend 24→32)
+                    acc <= acc + {{8{mult[23]}}, mult};
 
-                    // Advance innermost → outermost: kx → ky → ic
-                    if (kx == KERNEL - 1) begin
-                        kx <= 0;
-                        if (ky == KERNEL - 1) begin
-                            ky <= 0;
-                            if (ic == IN_CH - 1) begin
-                                state <= S_WRITE;
-                            end else begin
-                                ic <= ic + 1;
-                            end
-                        end else begin
-                            ky <= ky + 1;
-                        end
+                    if (kx == KERNEL-1 && ky == KERNEL-1 && ic == IN_CH-1) begin
+                        // All products for this output pixel done
+                        state <= S_WRITE;
                     end else begin
-                        kx <= kx + 1;
+                        // Advance counters & set next addresses
+                        if (kx < KERNEL - 1) begin
+                            kx      <= kx + 8'd1;
+                            in_addr <= in_addr + 12'd1;
+                        end else begin
+                            kx <= 0;
+                            if (ky < KERNEL - 1) begin
+                                ky      <= ky + 8'd1;
+                                in_addr <= in_addr + KY_STEP;
+                            end else begin
+                                ky <= 0;
+                                ic <= ic + 8'd1;
+                                in_addr <= in_addr + IC_STEP;
+                            end
+                        end
+                        w_addr <= w_addr + 15'd1;
+                        state  <= S_WAIT;
                     end
                 end
 
                 // -----------------------------------------------------------
                 S_WRITE: begin
-                    // Output address: oc*OUT_SIZE*OUT_SIZE + oy*OUT_SIZE + ox
-                    out_addr <= oc * (OUT_SIZE * OUT_SIZE) + oy * OUT_SIZE + ox;
+                    out_addr <= out_cnt;
                     out_data <= relu_out;
                     out_we   <= 1'b1;
+                    out_cnt  <= out_cnt + 12'd1;
 
-                    // Advance output position: ox → oy → oc
-                    if (ox == OUT_SIZE - 1) begin
-                        ox <= 0;
-                        if (oy == OUT_SIZE - 1) begin
-                            oy <= 0;
-                            if (oc == OUT_CH - 1) begin
-                                state <= S_DONE;
-                            end else begin
-                                oc <= oc + 1;
-                                state <= S_BIAS;
-                            end
-                        end else begin
-                            oy <= oy + 1;
-                            state <= S_BIAS;
-                        end
+                    // Advance output pixel (ox → oy → oc)
+                    if (ox < OUT_SIZE - 1) begin
+                        ox       <= ox + 8'd1;
+                        pix_base <= pix_base + 12'd1;
+                        state    <= S_BIAS;
                     end else begin
-                        ox <= ox + 1;
-                        state <= S_BIAS;
+                        ox <= 0;
+                        if (oy < OUT_SIZE - 1) begin
+                            oy       <= oy + 8'd1;
+                            pix_base <= pix_base + OY_STEP;
+                            state    <= S_BIAS;
+                        end else begin
+                            oy       <= 0;
+                            pix_base <= 12'd0;
+                            if (oc < OUT_CH - 1) begin
+                                oc     <= oc + 8'd1;
+                                w_base <= w_base + FILT_SIZE;
+                                state  <= S_BIAS;
+                            end else begin
+                                state <= S_DONE;
+                            end
+                        end
                     end
                 end
 

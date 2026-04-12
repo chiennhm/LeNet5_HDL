@@ -1,14 +1,19 @@
 // ============================================================================
-// Fully-Connected Layer Engine (Parameterized)
-// Computes  out[j] = (Σ_i  w[j][i] * in[i]) + bias[j]   then optional ReLU
-// Fixed-point Q8.8, 32-bit accumulator.
+// Fully-Connected Layer Engine — Resource-Optimized for Cyclone II
+//
+// Key changes vs. original:
+//   1. Weights in external weight_rom (M4K), accessed via w_addr/w_data.
+//   2. Biases kept as small INT8 register array.
+//   3. Weight address uses sequential counter (no j*IN_SIZE multiplier).
+//   4. S_WAIT state for 1-cycle M4K read latency.
+//
+// Arithmetic: same Q8.8 × INT8(Q0.7) scheme as conv_layer.
 // ============================================================================
 module fc_layer #(
     parameter IN_SIZE     = 120,
     parameter OUT_SIZE    = 84,
-    parameter WEIGHT_FILE = "mem/fc1_weights.hex",
     parameter BIAS_FILE   = "mem/fc1_bias.hex",
-    parameter APPLY_RELU  = 1            // 1 = apply ReLU, 0 = linear
+    parameter APPLY_RELU  = 1
 )(
     input  wire        clk,
     input  wire        rst_n,
@@ -16,29 +21,29 @@ module fc_layer #(
     output reg         done,
 
     // Input vector read port
-    output wire [11:0] in_addr,
+    output reg  [11:0] in_addr,
     input  wire signed [15:0] in_data,
 
     // Output vector write port
     output reg  [11:0] out_addr,
     output reg  signed [15:0] out_data,
-    output reg         out_we
+    output reg         out_we,
+
+    // Weight ROM read port
+    output reg  [14:0] w_addr,
+    input  wire signed [7:0]  w_data
 );
 
-    localparam NUM_WEIGHTS = OUT_SIZE * IN_SIZE;
-    localparam NUM_BIASES  = OUT_SIZE;
-
-    // ---- Weight / Bias ROM ------------------------------------------------
-    reg signed [15:0] weights [0:NUM_WEIGHTS-1];
-    reg signed [15:0] biases  [0:NUM_BIASES-1];
-    initial begin
-        $readmemh(WEIGHT_FILE, weights);
-        $readmemh(BIAS_FILE,   biases);
-    end
+    // ---- Bias ROM (small, remains in LUT registers) -----------------------
+    reg signed [7:0] biases [0:OUT_SIZE-1];
+    initial $readmemh(BIAS_FILE, biases);
 
     // ---- Counters ---------------------------------------------------------
     reg [7:0] j;    // output neuron index
     reg [7:0] i;    // input index
+
+    // ---- Weight address tracking ------------------------------------------
+    reg [14:0] w_base;   // start address for current output neuron j
 
     // ---- Accumulator ------------------------------------------------------
     reg signed [31:0] acc;
@@ -46,24 +51,18 @@ module fc_layer #(
     // ---- FSM --------------------------------------------------------------
     localparam S_IDLE  = 3'd0,
                S_BIAS  = 3'd1,
-               S_MAC   = 3'd2,
-               S_WRITE = 3'd3,
-               S_DONE  = 3'd4;
+               S_WAIT  = 3'd2,
+               S_MAC   = 3'd3,
+               S_WRITE = 3'd4,
+               S_DONE  = 3'd5;
     reg [2:0] state;
 
-    // ---- Combinational input address --------------------------------------
-    assign in_addr = {4'b0, i};
+    // ---- MAC: Q8.8 × INT8 = 24-bit signed --------------------------------
+    wire signed [23:0] mult = in_data * w_data;
 
-    // ---- Weight lookup ----------------------------------------------------
-    wire [15:0] w_idx = j * IN_SIZE + i;
-    wire signed [15:0] w_val = weights[w_idx];
-
-    // ---- Multiply ---------------------------------------------------------
-    wire signed [31:0] mult = in_data * w_val;
-
-    // ---- Q16.16 → Q8.8 with saturation & optional ReLU -------------------
-    wire signed [15:0] acc_q88 = acc[23:8];
-    wire overflow = (acc[31:24] != {8{acc[23]}});
+    // ---- Output: Q16.15 → Q8.8 with saturation & optional ReLU -----------
+    wire signed [15:0] acc_q88 = acc[22:7];
+    wire overflow = (acc[31:23] != {9{acc[22]}});
     wire signed [15:0] saturated = overflow
         ? (acc[31] ? 16'sh8000 : 16'sh7FFF)
         : acc_q88;
@@ -79,8 +78,11 @@ module fc_layer #(
             out_we   <= 1'b0;
             j <= 0; i <= 0;
             acc      <= 32'sd0;
-            out_addr <= 0;
-            out_data <= 0;
+            w_base   <= 15'd0;
+            in_addr  <= 12'd0;
+            w_addr   <= 15'd0;
+            out_addr <= 12'd0;
+            out_data <= 16'sd0;
         end else begin
             out_we <= 1'b0;
 
@@ -88,23 +90,34 @@ module fc_layer #(
                 S_IDLE: begin
                     done <= 1'b0;
                     if (start) begin
-                        j <= 0;
-                        state <= S_BIAS;
+                        j      <= 0;
+                        w_base <= 15'd0;
+                        state  <= S_BIAS;
                     end
                 end
 
                 S_BIAS: begin
-                    acc <= { {8{biases[j][15]}}, biases[j], 8'b0 };
-                    i   <= 0;
+                    acc     <= {{16{biases[j][7]}}, biases[j], 8'b0};
+                    i       <= 0;
+                    in_addr <= 12'd0;
+                    w_addr  <= w_base;
+                    state   <= S_WAIT;
+                end
+
+                S_WAIT: begin
                     state <= S_MAC;
                 end
 
                 S_MAC: begin
-                    acc <= acc + mult;
+                    acc <= acc + {{8{mult[23]}}, mult};
+
                     if (i == IN_SIZE - 1) begin
                         state <= S_WRITE;
                     end else begin
-                        i <= i + 1;
+                        i       <= i + 8'd1;
+                        in_addr <= in_addr + 12'd1;
+                        w_addr  <= w_addr  + 15'd1;
+                        state   <= S_WAIT;
                     end
                 end
 
@@ -116,8 +129,9 @@ module fc_layer #(
                     if (j == OUT_SIZE - 1) begin
                         state <= S_DONE;
                     end else begin
-                        j <= j + 1;
-                        state <= S_BIAS;
+                        j      <= j + 8'd1;
+                        w_base <= w_base + IN_SIZE;
+                        state  <= S_BIAS;
                     end
                 end
 
