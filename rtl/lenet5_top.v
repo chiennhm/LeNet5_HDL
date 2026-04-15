@@ -9,11 +9,12 @@
 //
 // Resource optimisations:
 //   ● Feature-map buffers → M4K dual-port RAM (dpram)
-//   ● All weights / biases → M4K synchronous ROM (weight_rom / registers)
+//   ● Weights in external SRAM, streamed by a shared read port
+//   ● Biases remain as small internal register arrays per layer
 //   ● No runtime multipliers for address calculation
-//   ● 2-cycle MAC pipeline (S_WAIT + S_MAC) for sync read latency
+//   ● MAC engines stall on weight-valid, tolerant to SRAM read latency
 //
-// Interface is UNCHANGED from original — drop-in replacement.
+// Note: top-level now exposes an SRAM weight read interface.
 // ============================================================================
 module lenet5_top (
     input  wire        clk,
@@ -27,7 +28,13 @@ module lenet5_top (
     // ---- Control & result -----------------------------------------------
     input  wire        start,
     output reg         done,
-    output wire [3:0]  digit_out
+    output wire [3:0]  digit_out,
+
+    // ---- External SRAM weight read interface ----------------------------
+    output wire        sram_rd_req,
+    output wire [23:0] sram_rd_addr,
+    input  wire signed [7:0] sram_rd_data,
+    input  wire        sram_rd_valid
 );
 
     // =====================================================================
@@ -62,8 +69,10 @@ module lenet5_top (
     wire [11:0]        c1_wr_addr;
     wire signed [15:0] c1_wr_data;
     wire               c1_wr_en;
+    wire               c1_w_req;
     wire [14:0]        c1_w_addr;
     wire signed [7:0]  c1_w_data;
+    wire               c1_w_valid;
 
     // -- S2 (reads buf_a, writes buf_b) --
     wire [11:0]        s2_rd_addr;
@@ -76,8 +85,10 @@ module lenet5_top (
     wire [11:0]        c3_wr_addr;
     wire signed [15:0] c3_wr_data;
     wire               c3_wr_en;
+    wire               c3_w_req;
     wire [14:0]        c3_w_addr;
     wire signed [7:0]  c3_w_data;
+    wire               c3_w_valid;
 
     // -- S4 (reads buf_a, writes buf_b) --
     wire [11:0]        s4_rd_addr;
@@ -90,27 +101,42 @@ module lenet5_top (
     wire [11:0]        c5_wr_addr;
     wire signed [15:0] c5_wr_data;
     wire               c5_wr_en;
+    wire               c5_w_req;
     wire [14:0]        c5_w_addr;
     wire signed [7:0]  c5_w_data;
+    wire               c5_w_valid;
 
     // -- FC1 (reads buf_a, writes buf_b) --
     wire [11:0]        fc1_rd_addr;
     wire [11:0]        fc1_wr_addr;
     wire signed [15:0] fc1_wr_data;
     wire               fc1_wr_en;
+    wire               fc1_w_req;
     wire [14:0]        fc1_w_addr;
     wire signed [7:0]  fc1_w_data;
+    wire               fc1_w_valid;
 
     // -- FC2 (reads buf_b, writes buf_a) --
     wire [11:0]        fc2_rd_addr;
     wire [11:0]        fc2_wr_addr;
     wire signed [15:0] fc2_wr_data;
     wire               fc2_wr_en;
+    wire               fc2_w_req;
     wire [14:0]        fc2_w_addr;
     wire signed [7:0]  fc2_w_data;
+    wire               fc2_w_valid;
 
     // -- Argmax (reads buf_a) --
     wire [11:0]        am_rd_addr;
+
+    // =====================================================================
+    //  WEIGHT ADDRESS MAP IN SRAM (contiguous INT8 storage)
+    // =====================================================================
+    localparam [23:0] WBASE_C1  = 24'd0;      // 150
+    localparam [23:0] WBASE_C3  = 24'd150;    // 2400
+    localparam [23:0] WBASE_C5  = 24'd2550;   // 30720
+    localparam [23:0] WBASE_FC1 = 24'd33270;  // 10080
+    localparam [23:0] WBASE_FC2 = 24'd43350;  // 840
 
     // =====================================================================
     //  FEATURE-MAP BUFFERS  (M4K dual-port RAM)
@@ -205,23 +231,58 @@ module lenet5_top (
     end
 
     // =====================================================================
-    //  WEIGHT ROMs  (M4K synchronous ROM, 8-bit INT8)
+    //  SRAM WEIGHT REQUEST MUX + RESPONSE DEMUX
     // =====================================================================
+    reg        sram_rd_req_r;
+    reg [23:0] sram_rd_addr_r;
 
-    weight_rom #(.ADDR_W( 8), .DATA_W(8), .DEPTH(150),   .MEM_FILE("mem/conv1_weights.hex"))
-        u_c1_wrom  (.clk(clk), .addr(c1_w_addr[7:0]),   .data(c1_w_data));
+    assign sram_rd_req  = sram_rd_req_r;
+    assign sram_rd_addr = sram_rd_addr_r;
 
-    weight_rom #(.ADDR_W(12), .DATA_W(8), .DEPTH(2400),  .MEM_FILE("mem/conv3_weights.hex"))
-        u_c3_wrom  (.clk(clk), .addr(c3_w_addr[11:0]),  .data(c3_w_data));
+    // Shared weight data bus. Only the active layer sees valid = 1.
+    assign c1_w_data   = sram_rd_data;
+    assign c3_w_data   = sram_rd_data;
+    assign c5_w_data   = sram_rd_data;
+    assign fc1_w_data  = sram_rd_data;
+    assign fc2_w_data  = sram_rd_data;
 
-    weight_rom #(.ADDR_W(15), .DATA_W(8), .DEPTH(30720), .MEM_FILE("mem/c5_weights.hex"))
-        u_c5_wrom  (.clk(clk), .addr(c5_w_addr[14:0]),  .data(c5_w_data));
+    assign c1_w_valid  = sram_rd_valid && (fsm == ST_RUN_C1);
+    assign c3_w_valid  = sram_rd_valid && (fsm == ST_RUN_C3);
+    assign c5_w_valid  = sram_rd_valid && (fsm == ST_RUN_C5);
+    assign fc1_w_valid = sram_rd_valid && (fsm == ST_RUN_FC1);
+    assign fc2_w_valid = sram_rd_valid && (fsm == ST_RUN_FC2);
 
-    weight_rom #(.ADDR_W(14), .DATA_W(8), .DEPTH(10080), .MEM_FILE("mem/fc1_weights.hex"))
-        u_fc1_wrom (.clk(clk), .addr(fc1_w_addr[13:0]), .data(fc1_w_data));
+    always @(*) begin
+        sram_rd_req_r  = 1'b0;
+        sram_rd_addr_r = 24'd0;
 
-    weight_rom #(.ADDR_W(10), .DATA_W(8), .DEPTH(840),   .MEM_FILE("mem/fc2_weights.hex"))
-        u_fc2_wrom (.clk(clk), .addr(fc2_w_addr[9:0]),  .data(fc2_w_data));
+        case (fsm)
+            ST_RUN_C1: begin
+                sram_rd_req_r  = c1_w_req;
+                sram_rd_addr_r = WBASE_C1 + c1_w_addr;
+            end
+            ST_RUN_C3: begin
+                sram_rd_req_r  = c3_w_req;
+                sram_rd_addr_r = WBASE_C3 + c3_w_addr;
+            end
+            ST_RUN_C5: begin
+                sram_rd_req_r  = c5_w_req;
+                sram_rd_addr_r = WBASE_C5 + c5_w_addr;
+            end
+            ST_RUN_FC1: begin
+                sram_rd_req_r  = fc1_w_req;
+                sram_rd_addr_r = WBASE_FC1 + fc1_w_addr;
+            end
+            ST_RUN_FC2: begin
+                sram_rd_req_r  = fc2_w_req;
+                sram_rd_addr_r = WBASE_FC2 + fc2_w_addr;
+            end
+            default: begin
+                sram_rd_req_r  = 1'b0;
+                sram_rd_addr_r = 24'd0;
+            end
+        endcase
+    end
 
     // =====================================================================
     //  LAYER INSTANCES
@@ -235,7 +296,8 @@ module lenet5_top (
         .clk(clk), .rst_n(rst_n), .start(c1_start), .done(c1_done),
         .in_addr(c1_rd_addr), .in_data(buf_in_rdata),
         .out_addr(c1_wr_addr), .out_data(c1_wr_data), .out_we(c1_wr_en),
-        .w_addr(c1_w_addr), .w_data(c1_w_data)
+        .w_req(c1_w_req), .w_addr(c1_w_addr),
+        .w_data(c1_w_data), .w_valid(c1_w_valid)
     );
 
     // ---- S2: AvgPool 24×24×6 → 12×12×6 ----------------------------------
@@ -255,7 +317,8 @@ module lenet5_top (
         .clk(clk), .rst_n(rst_n), .start(c3_start), .done(c3_done),
         .in_addr(c3_rd_addr), .in_data(buf_b_rdata),
         .out_addr(c3_wr_addr), .out_data(c3_wr_data), .out_we(c3_wr_en),
-        .w_addr(c3_w_addr), .w_data(c3_w_data)
+        .w_req(c3_w_req), .w_addr(c3_w_addr),
+        .w_data(c3_w_data), .w_valid(c3_w_valid)
     );
 
     // ---- S4: AvgPool 8×8×16 → 4×4×16 ------------------------------------
@@ -275,7 +338,8 @@ module lenet5_top (
         .clk(clk), .rst_n(rst_n), .start(c5_start), .done(c5_done),
         .in_addr(c5_rd_addr), .in_data(buf_b_rdata),
         .out_addr(c5_wr_addr), .out_data(c5_wr_data), .out_we(c5_wr_en),
-        .w_addr(c5_w_addr), .w_data(c5_w_data)
+        .w_req(c5_w_req), .w_addr(c5_w_addr),
+        .w_data(c5_w_data), .w_valid(c5_w_valid)
     );
 
     // ---- FC1: 120 → 84 + ReLU -------------------------------------------
@@ -286,7 +350,8 @@ module lenet5_top (
         .clk(clk), .rst_n(rst_n), .start(fc1_start), .done(fc1_done),
         .in_addr(fc1_rd_addr), .in_data(buf_a_rdata),
         .out_addr(fc1_wr_addr), .out_data(fc1_wr_data), .out_we(fc1_wr_en),
-        .w_addr(fc1_w_addr), .w_data(fc1_w_data)
+        .w_req(fc1_w_req), .w_addr(fc1_w_addr),
+        .w_data(fc1_w_data), .w_valid(fc1_w_valid)
     );
 
     // ---- FC2: 84 → 10 (no ReLU — raw logits) ----------------------------
@@ -297,7 +362,8 @@ module lenet5_top (
         .clk(clk), .rst_n(rst_n), .start(fc2_start), .done(fc2_done),
         .in_addr(fc2_rd_addr), .in_data(buf_b_rdata),
         .out_addr(fc2_wr_addr), .out_data(fc2_wr_data), .out_we(fc2_wr_en),
-        .w_addr(fc2_w_addr), .w_data(fc2_w_data)
+        .w_req(fc2_w_req), .w_addr(fc2_w_addr),
+        .w_data(fc2_w_data), .w_valid(fc2_w_valid)
     );
 
     // ---- Argmax: 10 logits → 4-bit class --------------------------------

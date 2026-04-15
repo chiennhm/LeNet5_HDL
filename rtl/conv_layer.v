@@ -2,11 +2,12 @@
 // Convolution Layer Engine — Resource-Optimized for Cyclone II
 //
 // Key changes vs. original:
-//   1. Weights stored in external weight_rom (M4K), accessed via w_addr/w_data.
+//   1. Weights are requested through an external memory interface
+//      (w_req/w_addr + w_valid/w_data).
 //   2. Biases kept as small internal register array (INT8).
 //   3. All address computation uses sequential counters (additions only,
 //      no runtime multipliers).
-//   4. Extra S_WAIT state accounts for 1-cycle M4K read latency.
+//   4. S_WAIT state waits until a weight response is valid.
 //
 // Arithmetic:
 //   input  Q8.8 (16-bit signed)  ×  weight INT8 (Q0.7)
@@ -34,9 +35,11 @@ module conv_layer #(
     output reg  signed [15:0] out_data,
     output reg         out_we,
 
-    // Weight ROM read port
+    // External weight read port (e.g. SRAM bridge)
+    output reg         w_req,
     output reg  [14:0] w_addr,
-    input  wire signed [7:0]  w_data
+    input  wire signed [7:0]  w_data,
+    input  wire        w_valid
 );
 
     // ---- Derived constants (all compile-time, no hardware) -----------------
@@ -75,8 +78,11 @@ module conv_layer #(
                S_DONE  = 3'd5;
     reg [2:0] state;
 
+    // ---- Latched weight from memory response ------------------------------
+    reg signed [7:0] w_data_q;
+
     // ---- MAC arithmetic: Q8.8 × INT8(Q0.7) = Q8.15 (24-bit) -------------
-    wire signed [23:0] mult = in_data * w_data;
+    wire signed [23:0] mult = in_data * w_data_q;
 
     // ---- Output: Q16.15 accumulator → Q8.8 with saturation + ReLU --------
     wire signed [15:0] acc_q88 = acc[22:7];
@@ -99,11 +105,14 @@ module conv_layer #(
             w_base   <= 15'd0;
             out_cnt  <= 12'd0;
             in_addr  <= 12'd0;
+            w_req    <= 1'b0;
             w_addr   <= 15'd0;
+            w_data_q <= 8'sd0;
             out_addr <= 12'd0;
             out_data <= 16'sd0;
         end else begin
             out_we <= 1'b0;   // default: no write
+            w_req  <= 1'b0;   // default: no request
 
             case (state)
                 // -----------------------------------------------------------
@@ -123,16 +132,20 @@ module conv_layer #(
                     // Load bias (INT8, Q0.7) into acc aligned to Q16.15
                     acc <= {{16{biases[oc][7]}}, biases[oc], 8'b0};
                     ic  <= 0; ky <= 0; kx <= 0;
-                    // Issue first read addresses
+                    // Issue first input/weight addresses
                     in_addr <= pix_base;
                     w_addr  <= w_base;
+                    w_req   <= 1'b1;
                     state   <= S_WAIT;
                 end
 
                 // -----------------------------------------------------------
                 S_WAIT: begin
-                    // M4K registered read — data arrives next cycle
-                    state <= S_MAC;
+                    // Wait for the external memory response.
+                    if (w_valid) begin
+                        w_data_q <= w_data;
+                        state    <= S_MAC;
+                    end
                 end
 
                 // -----------------------------------------------------------
@@ -160,6 +173,7 @@ module conv_layer #(
                             end
                         end
                         w_addr <= w_addr + 15'd1;
+                        w_req  <= 1'b1;
                         state  <= S_WAIT;
                     end
                 end

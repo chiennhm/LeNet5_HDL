@@ -2,10 +2,11 @@
 // Fully-Connected Layer Engine — Resource-Optimized for Cyclone II
 //
 // Key changes vs. original:
-//   1. Weights in external weight_rom (M4K), accessed via w_addr/w_data.
+//   1. Weights are requested through an external memory interface
+//      (w_req/w_addr + w_valid/w_data).
 //   2. Biases kept as small INT8 register array.
 //   3. Weight address uses sequential counter (no j*IN_SIZE multiplier).
-//   4. S_WAIT state for 1-cycle M4K read latency.
+//   4. S_WAIT state waits for a valid memory response.
 //
 // Arithmetic: same Q8.8 × INT8(Q0.7) scheme as conv_layer.
 // ============================================================================
@@ -29,9 +30,11 @@ module fc_layer #(
     output reg  signed [15:0] out_data,
     output reg         out_we,
 
-    // Weight ROM read port
+    // External weight read port (e.g. SRAM bridge)
+    output reg         w_req,
     output reg  [14:0] w_addr,
-    input  wire signed [7:0]  w_data
+    input  wire signed [7:0]  w_data,
+    input  wire        w_valid
 );
 
     // ---- Bias ROM (small, remains in LUT registers) -----------------------
@@ -57,8 +60,11 @@ module fc_layer #(
                S_DONE  = 3'd5;
     reg [2:0] state;
 
+    // ---- Latched weight from memory response ------------------------------
+    reg signed [7:0] w_data_q;
+
     // ---- MAC: Q8.8 × INT8 = 24-bit signed --------------------------------
-    wire signed [23:0] mult = in_data * w_data;
+    wire signed [23:0] mult = in_data * w_data_q;
 
     // ---- Output: Q16.15 → Q8.8 with saturation & optional ReLU -----------
     wire signed [15:0] acc_q88 = acc[22:7];
@@ -80,11 +86,14 @@ module fc_layer #(
             acc      <= 32'sd0;
             w_base   <= 15'd0;
             in_addr  <= 12'd0;
+            w_req    <= 1'b0;
             w_addr   <= 15'd0;
+            w_data_q <= 8'sd0;
             out_addr <= 12'd0;
             out_data <= 16'sd0;
         end else begin
             out_we <= 1'b0;
+            w_req  <= 1'b0;
 
             case (state)
                 S_IDLE: begin
@@ -101,11 +110,15 @@ module fc_layer #(
                     i       <= 0;
                     in_addr <= 12'd0;
                     w_addr  <= w_base;
+                    w_req   <= 1'b1;
                     state   <= S_WAIT;
                 end
 
                 S_WAIT: begin
-                    state <= S_MAC;
+                    if (w_valid) begin
+                        w_data_q <= w_data;
+                        state    <= S_MAC;
+                    end
                 end
 
                 S_MAC: begin
@@ -117,6 +130,7 @@ module fc_layer #(
                         i       <= i + 8'd1;
                         in_addr <= in_addr + 12'd1;
                         w_addr  <= w_addr  + 15'd1;
+                        w_req   <= 1'b1;
                         state   <= S_WAIT;
                     end
                 end

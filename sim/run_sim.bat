@@ -12,10 +12,11 @@ cd /d "%~dp0\.."
 REM Compile
 echo [1/2] Compiling...
 iverilog -g2005 -o sim/lenet5_sim.vvp ^
+    rtl/dpram.v ^
     rtl/relu.v ^
     rtl/argmax.v ^
     rtl/conv_layer.v ^
-    rtl/maxpool_layer.v ^
+    rtl/avgpool_layer.v ^
     rtl/fc_layer.v ^
     rtl/lenet5_top.v ^
     tb/tb_lenet5.v
