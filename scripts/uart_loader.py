@@ -374,8 +374,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="UART SRAM loader for LeNet-5 DE2")
     parser.add_argument("--port", required=True,
                         help="Serial port, for example COM5")
-    parser.add_argument("--baud", type=int, default=921600,
-                        help="UART baudrate (default: 921600)")
+    parser.add_argument("--baud", type=int, default=115200,
+                        help="UART baudrate (default: 115200)")
     parser.add_argument("--timeout", type=float, default=1.0,
                         help="Serial timeout in seconds")
 
@@ -385,7 +385,7 @@ def build_parser() -> argparse.ArgumentParser:
         "program", help="Program all model weight files to SRAM")
     p_program.add_argument(
         "--mem-dir",
-        default=str((Path(__file__).resolve().parents[1] / "mem")),
+        default=str(Path(__file__).resolve().parents[1] / "mem"),
         help="Folder containing weight hex files",
     )
     p_program.add_argument(

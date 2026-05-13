@@ -3,8 +3,9 @@
 // - Uses CLOCK_50 as system clock
 // - Uses KEY[0] as active-low reset
 // - Loads one 28x28 test image from hex into core input buffer at boot
-// - Reads weights from external SRAM through sram_read_bridge_de2
+// - Reads weights from external SRAM through sram_controller_de2
 // - Press KEY[1] to start inference
+// - UART (9600-8N1) for PC communication: weight loading, inference, status
 // ============================================================================
 module lenet5_de2_top (
     input  wire        CLOCK_50,
@@ -27,7 +28,11 @@ module lenet5_de2_top (
     output wire        SRAM_OE_N,
     output wire        SRAM_UB_N,
     output wire        SRAM_LB_N,
-    output wire        SRAM_CE_N
+    output wire        SRAM_CE_N,
+
+    // UART pins (directly exposed on DE2 header)
+    input  wire        UART_RXD,
+    output wire        UART_TXD
 );
 
     localparam IMG_SIZE = 10'd784;
@@ -53,6 +58,20 @@ module lenet5_de2_top (
     wire [23:0] core_sram_rd_addr;
     wire signed [7:0] core_sram_rd_data;
     wire        core_sram_rd_valid;
+
+    // SRAM write channel from UART protocol handler.
+    wire        uart_sram_wr_req;
+    wire [23:0] uart_sram_wr_addr;
+    wire [7:0]  uart_sram_wr_data;
+    wire        uart_sram_wr_done;
+
+    // UART core-control signals from protocol handler.
+    wire        uart_core_start;
+
+    // UART image write channel from protocol handler.
+    wire        uart_img_wr_en;
+    wire [9:0]  uart_img_wr_addr;
+    wire [7:0]  uart_img_wr_data;
 
     // Boot-time image loader.
     reg        loading_img;
@@ -87,13 +106,19 @@ module lenet5_de2_top (
                 end else begin
                     load_idx <= load_idx + 10'd1;
                 end
-            end else if (start_btn_pulse) begin
+            end else if (uart_img_wr_en) begin
+                pixel_addr <= uart_img_wr_addr;
+                pixel_data <= uart_img_wr_data;
+                pixel_we   <= 1'b1;
+            end else if (start_btn_pulse || uart_core_start) begin
                 start <= 1'b1;
             end
         end
     end
 
-    // Core instance
+    // ================================================================
+    //  LeNet-5 Core
+    // ================================================================
     lenet5_top u_core (
         .clk           (clk),
         .rst_n         (rst_n),
@@ -109,14 +134,23 @@ module lenet5_de2_top (
         .sram_rd_valid (core_sram_rd_valid)
     );
 
-    // Physical SRAM read bridge
-    sram_read_bridge_de2 u_sram_bridge (
+    // ================================================================
+    //  Unified SRAM Controller (read + write)
+    // ================================================================
+    sram_controller_de2 u_sram_ctrl (
         .clk      (clk),
         .rst_n    (rst_n),
+        // Read port (LeNet core)
         .rd_req   (core_sram_rd_req),
         .rd_addr  (core_sram_rd_addr),
         .rd_data  (core_sram_rd_data),
         .rd_valid (core_sram_rd_valid),
+        // Write port (UART loader)
+        .wr_req   (uart_sram_wr_req),
+        .wr_addr  (uart_sram_wr_addr),
+        .wr_data  (uart_sram_wr_data),
+        .wr_done  (uart_sram_wr_done),
+        // Physical SRAM pins
         .SRAM_ADDR(SRAM_ADDR),
         .SRAM_DQ  (SRAM_DQ),
         .SRAM_CE_N(SRAM_CE_N),
@@ -126,6 +160,68 @@ module lenet5_de2_top (
         .SRAM_LB_N(SRAM_LB_N)
     );
 
+    // ================================================================
+    //  UART RX / TX
+    // ================================================================
+    wire [7:0] uart_rx_data;
+    wire       uart_rx_valid;
+    wire [7:0] uart_tx_data;
+    wire       uart_tx_start;
+    wire       uart_tx_busy;
+
+    uart_rx #(
+        .CLK_FREQ  (50_000_000),
+        .BAUD_RATE (115200)
+    ) u_uart_rx (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .rx_in    (UART_RXD),
+        .rx_data  (uart_rx_data),
+        .rx_valid (uart_rx_valid)
+    );
+
+    uart_tx #(
+        .CLK_FREQ  (50_000_000),
+        .BAUD_RATE (115200)
+    ) u_uart_tx (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .tx_data  (uart_tx_data),
+        .tx_start (uart_tx_start),
+        .tx_out   (UART_TXD),
+        .tx_busy  (uart_tx_busy)
+    );
+
+    // ================================================================
+    //  UART Protocol Handler
+    // ================================================================
+    uart_protocol u_uart_proto (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        // UART byte interface
+        .rx_data      (uart_rx_data),
+        .rx_valid     (uart_rx_valid),
+        .tx_data      (uart_tx_data),
+        .tx_start     (uart_tx_start),
+        .tx_busy      (uart_tx_busy),
+        // SRAM write
+        .sram_wr_req  (uart_sram_wr_req),
+        .sram_wr_addr (uart_sram_wr_addr),
+        .sram_wr_data (uart_sram_wr_data),
+        .sram_wr_done (uart_sram_wr_done),
+        // Core control
+        .core_start   (uart_core_start),
+        .core_done    (done),
+        .core_digit   (digit_out),
+        // Image buffer write
+        .img_wr_en    (uart_img_wr_en),
+        .img_wr_addr  (uart_img_wr_addr),
+        .img_wr_data  (uart_img_wr_data)
+    );
+
+    // ================================================================
+    //  7-Segment Decoder
+    // ================================================================
     function [6:0] seg7;
         input [3:0] val;
         begin

@@ -7,6 +7,10 @@
 // ============================================================================
 `timescale 1ns / 1ps
 
+`ifndef IMG_HEX_FILE
+`define IMG_HEX_FILE "mem/test_img_61_label_8.hex"
+`endif
+
 module sram_weight_model #(
     parameter ADDR_W     = 24,
     parameter DATA_W     = 8,
@@ -128,6 +132,9 @@ module tb_lenet5;
     reg signed [7:0] fc1_w   [0:10079];
     reg signed [7:0] fc2_w   [0:839];
     reg        [7:0] test_img[0:783];
+    integer k;
+    integer img_nonzero_cnt;
+    reg [7:0] img_max;
 
     initial begin
         $readmemh("mem/conv1_weights.hex", conv1_w);
@@ -135,13 +142,25 @@ module tb_lenet5;
         $readmemh("mem/c5_weights.hex",    c5_w);
         $readmemh("mem/fc1_weights.hex",   fc1_w);
         $readmemh("mem/fc2_weights.hex",   fc2_w);
-        $readmemh("mem/test_image.hex",  test_img);
+        $readmemh(`IMG_HEX_FILE,            test_img);
 
         // Catch missing/unreadable image file early.
         if (^test_img[0] === 1'bx) begin
-            $display("ERROR: Failed to load mem/test_image.hex");
+            $display("ERROR: Failed to load image file: %s", `IMG_HEX_FILE);
             $finish;
         end
+
+        img_nonzero_cnt = 0;
+        img_max = 8'd0;
+        for (k = 0; k < 784; k = k + 1) begin
+            if (test_img[k] != 8'd0) begin
+                img_nonzero_cnt = img_nonzero_cnt + 1;
+            end
+            if (test_img[k] > img_max) begin
+                img_max = test_img[k];
+            end
+        end
+        $display("Image stats: nonzero=%0d/784, max=%0d", img_nonzero_cnt, img_max);
     end
 
     // ---- Cycle counter (inference only) -----------------------------------

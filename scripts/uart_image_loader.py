@@ -131,15 +131,14 @@ def build_parser() -> argparse.ArgumentParser:
         description="UART runtime image loader for LeNet-5")
     parser.add_argument("--port", required=True,
                         help="Serial port, for example COM5")
-    parser.add_argument("--baud", type=int, default=921600,
+    parser.add_argument("--baud", type=int, default=115200,
                         help="UART baudrate")
     parser.add_argument("--timeout", type=float, default=1.0,
                         help="Serial timeout in seconds")
 
     parser.add_argument(
         "--image",
-        default=str(
-            (Path(__file__).resolve().parents[1] / "mem" / "test_image.hex")),
+        default=str("D:\\LeNetHDL\\scripts\\hex_images\\test_img_1_label_2.hex"),  
         help="Path to 28x28 image in readmemh format",
     )
     parser.add_argument(
