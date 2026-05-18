@@ -60,7 +60,7 @@ def load_quantized_to_model(model, quant_info):
 
 
 def main():
-    _, test_loader, _ = get_data_loaders()
+    _, _, test_loader = get_data_loaders()
 
     # Evaluate FP32 model
     model_fp32 = LeNet5()

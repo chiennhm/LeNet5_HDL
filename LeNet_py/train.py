@@ -6,9 +6,11 @@ from torchvision import datasets, transforms
 
 from model import LeNet5, count_parameters
 
-
-def get_data_loaders(data_dir="./data", batch_size=64, val_split=0.1):
+# TODO: Add random state
+def get_data_loaders(data_dir="./data", batch_size=64, val_split=0.1, seed=42):
     """Create MNIST train, val and test data loaders (90/10 split)."""
+    if seed:
+        print("Using seed: ", seed)
     transform = transforms.ToTensor()
 
     full_train_dataset = datasets.MNIST(root=data_dir, train=True,
@@ -19,10 +21,10 @@ def get_data_loaders(data_dir="./data", batch_size=64, val_split=0.1):
     # Split train into train (90%) and val (10%)
     val_size = int(len(full_train_dataset) * val_split)
     train_size = len(full_train_dataset) - val_size
-    train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
+    train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(seed))
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=torch.Generator().manual_seed(seed))
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=True, generator=torch.Generator().manual_seed(seed))
     test_loader  = DataLoader(test_dataset,  batch_size=batch_size)
 
     return train_loader, val_loader, test_loader
