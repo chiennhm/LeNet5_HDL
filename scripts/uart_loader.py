@@ -62,6 +62,10 @@ CMD_WRITE_SRAM = 0x01
 CMD_START_INFERENCE = 0x02
 CMD_GET_STATUS = 0x03
 
+MAX_DEVICE_PAYLOAD = 512
+MAX_SRAM_CHUNK = MAX_DEVICE_PAYLOAD - 5
+SRAM_SIZE_BYTES = 512 * 1024
+
 # LeNet weight map in external SRAM.
 WEIGHT_LAYOUT: Tuple[Tuple[str, str, int, int], ...] = (
     ("conv1", "conv1_weights.hex", 0, 150),
@@ -207,11 +211,14 @@ class UartLeNetLoader:
             return payload.hex()
 
     def write_sram(self, addr: int, data: bytes) -> None:
-        if addr < 0 or addr >= (1 << 24):
+        if addr < 0 or addr >= SRAM_SIZE_BYTES:
             raise ValueError(f"Address out of range: {addr}")
-        if len(data) > 0xFFFF:
+        if len(data) > MAX_SRAM_CHUNK:
             raise ValueError(
-                "Single WRITE_SRAM block is limited to 65535 bytes")
+                f"Single WRITE_SRAM block is limited to {MAX_SRAM_CHUNK} bytes")
+        if addr + len(data) > SRAM_SIZE_BYTES:
+            raise ValueError(
+                f"WRITE_SRAM range exceeds SRAM size: 0x{addr:06X}+{len(data)}")
 
         payload = addr.to_bytes(3, "little") + \
             len(data).to_bytes(2, "little") + data
@@ -226,6 +233,13 @@ class UartLeNetLoader:
                 )
 
     def write_sram_chunked(self, base_addr: int, data: bytes, chunk_size: int, label: str) -> None:
+        if chunk_size <= 0 or chunk_size > MAX_SRAM_CHUNK:
+            raise ValueError(
+                f"chunk_size must be in range 1..{MAX_SRAM_CHUNK}")
+        if base_addr < 0 or base_addr + len(data) > SRAM_SIZE_BYTES:
+            raise ValueError(
+                f"{label} range exceeds SRAM size: 0x{base_addr:06X}+{len(data)}")
+
         total = len(data)
         sent = 0
         start_t = time.time()

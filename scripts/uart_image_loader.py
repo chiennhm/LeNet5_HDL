@@ -25,6 +25,8 @@ from pathlib import Path
 
 from uart_loader import (
     DeviceStatusError,
+    MAX_DEVICE_PAYLOAD,
+    MAX_SRAM_CHUNK,
     ProtocolError,
     UartLeNetLoader,
     parse_readmemh_bytes,
@@ -34,6 +36,7 @@ from uart_loader import (
 # New command for direct image streaming endpoint in FPGA UART firmware.
 CMD_WRITE_IMAGE = 0x04
 IMAGE_SIZE = 784
+MAX_IMAGE_CHUNK = MAX_DEVICE_PAYLOAD - 4
 
 
 def load_image_bytes(image_file: Path) -> bytes:
@@ -61,6 +64,10 @@ def write_image_by_command(
     Payload format:
         [OFFSET_L][OFFSET_H][SIZE_L][SIZE_H][DATA...]
     """
+    if chunk_size <= 0 or chunk_size > MAX_IMAGE_CHUNK:
+        raise ValueError(
+            f"image-cmd chunk_size must be in range 1..{MAX_IMAGE_CHUNK}")
+
     sent = 0
     total = len(image_data)
 
@@ -175,8 +182,11 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.chunk_size <= 0 or args.chunk_size > 4096:
-        print("ERROR: --chunk-size must be in range 1..4096", file=sys.stderr)
+    max_chunk = MAX_IMAGE_CHUNK if args.method == "image-cmd" else MAX_SRAM_CHUNK
+    if args.chunk_size <= 0 or args.chunk_size > max_chunk:
+        print(
+            f"ERROR: --chunk-size must be in range 1..{max_chunk} for {args.method}",
+            file=sys.stderr)
         return 2
 
     try:

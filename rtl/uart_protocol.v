@@ -58,6 +58,8 @@ module uart_protocol #(
     localparam CMD_START_INFERENCE = 8'h02;
     localparam CMD_GET_STATUS      = 8'h03;
     localparam CMD_WRITE_IMAGE     = 8'h04;
+    localparam [15:0] MAX_PAYLOAD_BYTES = MAX_PAYLOAD;
+    localparam [23:0] SRAM_SIZE_BYTES   = 24'h080000;
 
     // =====================================================================
     //  FSM states
@@ -72,8 +74,6 @@ module uart_protocol #(
         RX_CRC_L    = 5'd6,
         RX_CRC_H    = 5'd7,
         DISPATCH    = 5'd8,
-        WR_INIT     = 5'd9,
-        WR_READ_BUF = 5'd10,
         WR_ISSUE    = 5'd11,
         WR_WAIT     = 5'd12,
         TX_SOF      = 5'd13,
@@ -85,9 +85,7 @@ module uart_protocol #(
         TX_CRC_L    = 5'd19,
         TX_CRC_H    = 5'd20,
         TX_DONE     = 5'd21,
-        IMG_INIT     = 5'd22,
-        IMG_READ_HDR = 5'd23,
-        IMG_WRITE    = 5'd24;
+        IMG_WRITE   = 5'd24;
 
     reg [4:0] state;
 
@@ -102,19 +100,11 @@ module uart_protocol #(
     reg [15:0] rx_crc_calc;     // CRC computed locally
 
     // =====================================================================
-    //  Payload buffer (dual-port RAM style, using register array)
+    //  Payload buffer (register array)
     //  At 9600 baud the data rate is only ~960 B/s, so 512 regs are fine
     //  and avoid an extra dpram instance.
     // =====================================================================
     reg [7:0] payload_buf [0:MAX_PAYLOAD-1];
-    reg [8:0] buf_waddr;
-    reg [8:0] buf_raddr;
-    reg [7:0] buf_rdata;
-
-    // Read from payload buffer (synchronous)
-    always @(posedge clk) begin
-        buf_rdata <= payload_buf[buf_raddr];
-    end
 
     // =====================================================================
     //  TX response registers
@@ -171,8 +161,6 @@ module uart_protocol #(
             rx_cnt       <= 16'd0;
             rx_crc_rx    <= 16'd0;
             rx_crc_calc  <= 16'hFFFF;
-            buf_waddr    <= 9'd0;
-            buf_raddr    <= 9'd0;
             resp_status  <= 8'd0;
             resp_len     <= 16'd0;
             resp_cnt     <= 16'd0;
@@ -239,7 +227,6 @@ module uart_protocol #(
                         rx_len[15:8] <= rx_data;
                         rx_crc_calc  <= crc16_byte(rx_crc_calc, rx_data);
                         rx_cnt       <= 16'd0;
-                        buf_waddr    <= 9'd0;
                         if ({rx_data, rx_len[7:0]} == 16'd0)
                             state <= RX_CRC_L;    // no payload
                         else
@@ -250,9 +237,8 @@ module uart_protocol #(
                 RX_PAYLOAD: begin
                     if (rx_valid) begin
                         rx_crc_calc <= crc16_byte(rx_crc_calc, rx_data);
-                        if (buf_waddr < MAX_PAYLOAD)
-                            payload_buf[buf_waddr] <= rx_data;
-                        buf_waddr <= buf_waddr + 9'd1;
+                        if (rx_cnt < MAX_PAYLOAD_BYTES)
+                            payload_buf[rx_cnt[8:0]] <= rx_data;
                         rx_cnt    <= rx_cnt + 16'd1;
                         if (rx_cnt + 16'd1 == rx_len)
                             state <= RX_CRC_L;
@@ -293,8 +279,31 @@ module uart_protocol #(
 
                             CMD_WRITE_SRAM: begin
                                 // payload[0..2] = addr,  [3..4] = size
-                                buf_raddr <= 9'd0;
-                                state     <= WR_INIT;
+                                if (rx_len < 16'd5 || rx_len > MAX_PAYLOAD_BYTES) begin
+                                    resp_status <= 8'h02;   // malformed payload
+                                    resp_len    <= 16'd0;
+                                    state       <= TX_SOF;
+                                end else if ({payload_buf[4], payload_buf[3]} != (rx_len - 16'd5)) begin
+                                    resp_status <= 8'h02;   // size field mismatch
+                                    resp_len    <= 16'd0;
+                                    state       <= TX_SOF;
+                                end else if (({1'b0, payload_buf[2], payload_buf[1], payload_buf[0]} + {9'd0, payload_buf[4], payload_buf[3]}) > {1'b0, SRAM_SIZE_BYTES}) begin
+                                    resp_status <= 8'h02;   // SRAM address range overflow
+                                    resp_len    <= 16'd0;
+                                    state       <= TX_SOF;
+                                end else begin
+                                    wr_base_addr <= {payload_buf[2], payload_buf[1], payload_buf[0]};
+                                    wr_size      <= {payload_buf[4], payload_buf[3]};
+                                    wr_idx       <= 16'd0;
+                                    if ({payload_buf[4], payload_buf[3]} == 16'd0) begin
+                                        resp_len    <= 16'd2;
+                                        resp_buf[0] <= payload_buf[3];
+                                        resp_buf[1] <= payload_buf[4];
+                                        state       <= TX_SOF;
+                                    end else begin
+                                        state <= WR_ISSUE;
+                                    end
+                                end
                             end
 
                             CMD_START_INFERENCE: begin
@@ -312,8 +321,27 @@ module uart_protocol #(
 
                             CMD_WRITE_IMAGE: begin
                                 // payload[0..1] = offset, [2..3] = size
-                                buf_raddr <= 9'd0;
-                                state     <= IMG_INIT;
+                                if (rx_len < 16'd4 || rx_len > MAX_PAYLOAD_BYTES) begin
+                                    resp_status <= 8'h02;   // malformed payload
+                                    resp_len    <= 16'd0;
+                                    state       <= TX_SOF;
+                                end else if ({payload_buf[3], payload_buf[2]} != (rx_len - 16'd4)) begin
+                                    resp_status <= 8'h02;   // size field mismatch
+                                    resp_len    <= 16'd0;
+                                    state       <= TX_SOF;
+                                end else begin
+                                    img_offset <= {payload_buf[1], payload_buf[0]};
+                                    img_size   <= {payload_buf[3], payload_buf[2]};
+                                    img_idx    <= 16'd0;
+                                    if ({payload_buf[3], payload_buf[2]} == 16'd0) begin
+                                        resp_len    <= 16'd2;
+                                        resp_buf[0] <= payload_buf[2];
+                                        resp_buf[1] <= payload_buf[3];
+                                        state       <= TX_SOF;
+                                    end else begin
+                                        state <= IMG_WRITE;
+                                    end
+                                end
                             end
 
                             default: begin
@@ -328,154 +356,67 @@ module uart_protocol #(
                 // =============================================================
                 //  WRITE_SRAM — stream buffered payload into SRAM
                 // =============================================================
-                WR_INIT: begin
-                    // Wait one cycle for buf_rdata of addr byte 0
-                    buf_raddr <= 9'd1;
-                    state     <= WR_INIT + 5'd1;  // trick: falls through to a unique handler
-                    // Actually, let me use explicit sub-states for clarity.
-                    // We'll read the 5 header bytes from the buffer over
-                    // several cycles, then iterate over data bytes.
+    WR_ISSUE:
+      begin
+        sram_wr_req  <= 1'b1;
+        sram_wr_addr <= wr_base_addr + {8'd0, wr_idx};
+        sram_wr_data <= payload_buf[9'd5 + wr_idx[8:0]];
+        state        <= WR_WAIT;
+      end
 
-                    // Cycle 0: buf_raddr=0 was set in DISPATCH, read addr[0]
-                    // We need to clock through to get buf_rdata.
-                    // Let's read all 5 bytes in a mini-sequence.
-                    wr_idx <= 16'd0;
-                    state  <= WR_READ_BUF;
+      WR_WAIT:
+        begin
+          if (sram_wr_done)
+          begin
+            wr_idx <= wr_idx + 16'd1;
+            if (wr_idx + 16'd1 == wr_size)
+            begin
+              // All bytes written — send response
+              resp_len    <= 16'd2;
+              resp_buf[0] <= wr_size[7:0];
+              resp_buf[1] <= wr_size[15:8];
+              state       <= TX_SOF;
+            end
+            else
+            begin
+              state     <= WR_ISSUE;
+            end
+          end
+        end
+
+        // =============================================================
+        //  WRITE_IMAGE — stream buffered payload into image buffer
+        //  Payload: [OFFSET_L][OFFSET_H][SIZE_L][SIZE_H][DATA...]
+        //  dpram write is single-cycle, no handshake needed.
+        // =============================================================
+            IMG_WRITE:
+              begin
+                // Write one pixel per cycle
+                img_wr_en   <= 1'b1;
+                img_wr_addr <= img_offset[9:0] + img_idx[9:0];
+                img_wr_data <= payload_buf[9'd4 + img_idx[8:0]];
+                img_idx     <= img_idx + 16'd1;
+                if (img_idx + 16'd1 == img_size)
+                begin
+                  resp_len    <= 16'd2;
+                  resp_buf[0] <= img_size[7:0];
+                  resp_buf[1] <= img_size[15:8];
+                  state       <= TX_SOF;
                 end
-
-                // We re-use WR_READ_BUF to read the 5-byte header from the
-                // payload buffer (addr[2:0], size[1:0]).  wr_idx counts 0..4.
-                WR_READ_BUF: begin
-                    // buf_rdata is valid for (buf_raddr - 1) due to sync read.
-                    case (wr_idx)
-                        16'd0: begin
-                            // buf_raddr was set to 0 two cycles ago → rdata valid
-                            wr_base_addr[7:0] <= buf_rdata;
-                            buf_raddr <= 9'd2;
-                        end
-                        16'd1: begin
-                            wr_base_addr[15:8] <= buf_rdata;
-                            buf_raddr <= 9'd3;
-                        end
-                        16'd2: begin
-                            wr_base_addr[23:16] <= buf_rdata;
-                            buf_raddr <= 9'd4;
-                        end
-                        16'd3: begin
-                            wr_size[7:0] <= buf_rdata;
-                            buf_raddr <= 9'd5;    // Request first data byte NOW
-                        end
-                        16'd4: begin
-                            wr_size[15:8] <= buf_rdata;
-                            wr_idx <= 16'd0;      // reuse as data index
-                            buf_raddr <= 9'd6;    // Request second data byte NOW
-                            // If size is 0, skip directly to response
-                            if ({buf_rdata, wr_size[7:0]} == 16'd0) begin
-                                resp_len    <= 16'd2;
-                                resp_buf[0] <= wr_size[7:0];
-                                resp_buf[1] <= buf_rdata;
-                                state       <= TX_SOF;
-                            end else begin
-                                state <= WR_ISSUE;
-                            end
-                        end
-                        default: ;
-                    endcase
-                    if (wr_idx < 16'd4)
-                        wr_idx <= wr_idx + 16'd1;
+                else
+                begin
+                  state     <= IMG_WRITE;
                 end
+              end
 
-                WR_ISSUE: begin
-                    // buf_rdata holds the current data byte
-                    sram_wr_req  <= 1'b1;
-                    sram_wr_addr <= wr_base_addr + {8'd0, wr_idx};
-                    sram_wr_data <= buf_rdata;
-                    buf_raddr    <= 9'd5 + wr_idx[8:0] + 9'd1; // Prefetch next byte
-                    state        <= WR_WAIT;
-                end
-
-                WR_WAIT: begin
-                    if (sram_wr_done) begin
-                        wr_idx <= wr_idx + 16'd1;
-                        if (wr_idx + 16'd1 == wr_size) begin
-                            // All bytes written — send response
-                            resp_len    <= 16'd2;
-                            resp_buf[0] <= wr_size[7:0];
-                            resp_buf[1] <= wr_size[15:8];
-                            state       <= TX_SOF;
-                        end else begin
-                            state     <= WR_ISSUE;
-                        end
-                    end
-                end
-
-                // =============================================================
-                //  WRITE_IMAGE — stream buffered payload into image buffer
-                //  Payload: [OFFSET_L][OFFSET_H][SIZE_L][SIZE_H][DATA...]
-                //  dpram write is single-cycle, no handshake needed.
-                // =============================================================
-                IMG_INIT: begin
-                    buf_raddr <= 9'd1;
-                    img_idx   <= 16'd0;
-                    state     <= IMG_READ_HDR;
-                end
-
-                IMG_READ_HDR: begin
-                    case (img_idx)
-                        16'd0: begin
-                            img_offset[7:0] <= buf_rdata;
-                            buf_raddr <= 9'd2;
-                        end
-                        16'd1: begin
-                            img_offset[15:8] <= buf_rdata;
-                            buf_raddr <= 9'd3;
-                        end
-                        16'd2: begin
-                            img_size[7:0] <= buf_rdata;
-                            buf_raddr <= 9'd5;  // Request first data byte NOW
-                        end
-                        16'd3: begin
-                            img_size[15:8] <= buf_rdata;
-                            img_idx <= 16'd0;
-                            buf_raddr <= 9'd6;  // Request second data byte NOW
-                            if ({buf_rdata, img_size[7:0]} == 16'd0) begin
-                                resp_len    <= 16'd2;
-                                resp_buf[0] <= img_size[7:0];
-                                resp_buf[1] <= buf_rdata;
-                                state       <= TX_SOF;
-                            end else begin
-                                state <= IMG_WRITE;
-                            end
-                        end
-                        default: ;
-                    endcase
-                    if (img_idx < 16'd3)
-                        img_idx <= img_idx + 16'd1;
-                end
-
-                IMG_WRITE: begin
-                    // Write one pixel per cycle
-                    img_wr_en   <= 1'b1;
-                    img_wr_addr <= img_offset[9:0] + img_idx[9:0];
-                    img_wr_data <= buf_rdata;
-                    img_idx     <= img_idx + 16'd1;
-                    if (img_idx + 16'd1 == img_size) begin
-                        resp_len    <= 16'd2;
-                        resp_buf[0] <= img_size[7:0];
-                        resp_buf[1] <= img_size[15:8];
-                        state       <= TX_SOF;
-                    end else begin
-                        buf_raddr <= 9'd5 + img_idx[8:0] + 9'd2; // Request next+1 byte
-                        state     <= IMG_WRITE;
-                    end
-                end
-
-                // =============================================================
-                //  TX path — build and send response frame
-                // =============================================================
-                TX_SOF: begin
-                    if (!tx_busy) begin
-                        tx_data  <= DEV_SOF;
+              // =============================================================
+              //  TX path — build and send response frame
+              // =============================================================
+              TX_SOF:
+                begin
+                  if (!tx_busy)
+                  begin
+                    tx_data  <= DEV_SOF;
                         tx_start <= 1'b1;
                         tx_crc   <= 16'hFFFF;
                         resp_cnt <= 16'd0;

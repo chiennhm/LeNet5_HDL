@@ -112,7 +112,7 @@ module tb_lenet5;
 
     // ---- Simulated SRAM ----------------------------------------------------
     sram_weight_model #(
-        .ADDR_W(24), .DATA_W(8), .DEPTH(65536), .RD_LATENCY(1)
+        .ADDR_W(24), .DATA_W(8), .DEPTH(524288), .RD_LATENCY(1)
     ) u_sram (
         .clk     (clk),
         .rst_n   (rst_n),

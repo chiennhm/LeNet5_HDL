@@ -5,7 +5,7 @@
 // - Loads one 28x28 test image from hex into core input buffer at boot
 // - Reads weights from external SRAM through sram_controller_de2
 // - Press KEY[1] to start inference
-// - UART (9600-8N1) for PC communication: weight loading, inference, status
+// - UART (115200-8N1) for PC communication: weight loading, inference, status
 // ============================================================================
 module lenet5_de2_top (
     input  wire        CLOCK_50,
