@@ -105,9 +105,21 @@ convolution layers and FC1, it also applies ReLU.
 | `buf_a` | 3456 | 16 | C1, C3, C5, FC2 outputs |
 | `buf_b` | 864 | 16 | S2, S4, FC1 outputs |
 
-`buf_a` and `buf_b` form a ping-pong buffer pair. Because layers run
-sequentially, the same physical RAM can safely store different tensors at
-different phases of inference.
+### Ping-Pong Buffer Mechanism
+
+The architecture uses a "ping-pong" memory mechanism to drastically optimize block RAM (M4K) usage on the FPGA. Instead of allocating a separate memory block for the output of every single layer—which would consume excessive resources—the design reuses just two physical dual-port RAMs: `buf_a` and `buf_b`.
+
+Because the top-level FSM executes only one layer at a time sequentially, the feature map data flows back and forth (like a ping-pong ball) between these two buffers:
+- **C1** reads from `buf_input` and writes its output to **`buf_a`**.
+- **S2** reads from **`buf_a`** and writes its output to **`buf_b`**.
+- **C3** reads from **`buf_b`** and writes its output to **`buf_a`**.
+- **S4** reads from **`buf_a`** and writes its output to **`buf_b`**.
+- **C5** reads from **`buf_b`** and writes its output to **`buf_a`**.
+- **FC1** reads from **`buf_a`** and writes its output to **`buf_b`**.
+- **FC2** reads from **`buf_b`** and writes its output to **`buf_a`**.
+- **Argmax** reads from **`buf_a`** to determine the final classification.
+
+By doing this, the hardware only needs to size each buffer for the *largest* single tensor it will ever hold during the inference process. For `buf_a`, the largest output is from C1 (24x24x6 = 3456 words). For `buf_b`, the largest output is from S2 (12x12x6 = 864 words).
 
 `rtl/dpram.v` is the internal memory primitive. It has one write port and one
 registered read port. This means read data is valid one clock after the address
@@ -129,6 +141,34 @@ Total external weight storage is 44,190 bytes.
 
 `lenet5_top` adds each layer's local weight address to the appropriate base
 address before sending the request to the SRAM controller.
+
+## Weight Transmission and Reception Process
+
+Because the DE2 board has limited internal memory, all convolution and fully-connected layer weights are stored in external SRAM. The weights are transmitted from the PC to the FPGA using a custom binary UART protocol before inference begins.
+
+The process is divided into two sides: Host (PC) and Device (FPGA).
+
+### 1. Host Side (Python Script)
+The script `scripts/uart_loader.py` handles parsing the `.hex` weight files and sending them to the FPGA.
+- **Parsing**: It reads the `$readmemh`-format files from the `mem/` directory and converts them into raw binary byte streams.
+- **Chunking**: To accommodate UART buffer limits and protocol constraints, the data is divided into chunks (maximum 507 data bytes per payload).
+- **Frame Construction**: For each chunk, it builds a `WRITE_SRAM` frame (Command `0x01`):
+  `[SOF=0xA5][CMD][SEQ][LEN_L][LEN_H][ADDR_0][ADDR_1][ADDR_2][SIZE_L][SIZE_H][DATA...][CRC_L][CRC_H]`
+  - `ADDR_0` to `ADDR_2` specify the 24-bit base address for this chunk.
+  - `SIZE_L` and `SIZE_H` specify the number of weight bytes in the chunk.
+- The script waits for an acknowledgment from the device before sending the next chunk, ensuring reliable transmission over UART.
+
+### 2. Device Side (FPGA RTL)
+The module `rtl/uart_protocol.v` acts as the UART endpoint and SRAM programmer.
+- **Receiving & Buffering**: It reads incoming UART bytes, verifying the sequence number and CRC-16 checksum. Valid data bytes are temporarily stored in an internal register array (`payload_buf`).
+- **SRAM Writing**: Once a complete `WRITE_SRAM` frame is received and verified, the FSM transitions to `WR_ISSUE` and `WR_WAIT` states. It sequentially fetches bytes from `payload_buf` and sends write requests to `sram_controller_de2.v`.
+- **Handshaking**: For every byte, `uart_protocol.v` asserts `sram_wr_req` and waits for `sram_wr_done` from the SRAM controller, properly handling the timing requirements of the physical external SRAM chips.
+- **Acknowledgment**: After the entire chunk is successfully written to SRAM, it sends a response frame back to the PC:
+  `[SOF=0x5A][SEQ][STATUS=0x00][LEN_L=2][LEN_H=0][SIZE_L][SIZE_H][CRC_L][CRC_H]`
+  This tells the host to proceed with sending the next chunk of weights.
+
+### 3. Inference Read
+During inference, the compute layers (`conv_layer.v`, `fc_layer.v`) request weights directly from the SRAM controller by asserting their read addresses. The UART interface should be inactive during this time to prevent SRAM read/write access contention.
 
 ## Module Mechanisms
 
